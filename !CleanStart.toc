@@ -2,7 +2,7 @@
 ## Title: !CleanStart
 ## Notes: Captures login messages and provides a GUI to review and manage them
 ## Author: Ginutty
-## Version: 1.2.0
+## Version: 1.2.1
 ## SavedVariables: CleanStartDB
 ## IconTexture: 655994
 

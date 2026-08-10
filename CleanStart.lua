@@ -23,7 +23,7 @@ local MSG_SYSTEM = "system"    -- has ID = system/player message (user choice)
 local function EnsureDefaults()
     if db.enabled == nil then db.enabled = true end
     if db.debug == nil then db.debug = false end
-    if db.blockWindow == nil then db.blockWindow = 1 end
+    if db.blockWindow == nil then db.blockWindow = 3 end
     if not db.customFilters then db.customFilters = {} end
     if not db.whitelist then db.whitelist = {} end
     if not db.blockedMessageIds then db.blockedMessageIds = {} end

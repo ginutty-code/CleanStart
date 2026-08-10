@@ -28,7 +28,7 @@ A World of Warcraft addon that captures all messages during login and provides a
 
 ### Login Window Capture
 
-When you log in, the addon captures ALL chat messages during a short window (default 1 second). Addon messages are blocked during this window, while system messages are allowed through.
+When you log in, the addon captures ALL chat messages during a short window (default 3 seconds). Addon messages are blocked during this window, while system messages are allowed through.
 
 If `/reload` is used while you're already inside a dungeon or raid, there's no login spam to catch, so CleanStart detects this and skips the capture window entirely rather than running it against live instance chat.
 
@@ -91,7 +91,7 @@ Use `/cleanstart` or `/cs` to interact with the addon.
 | `/cs` | Toggle the captured messages window |
 | `/cs on\|off` | Enable/disable filtering |
 | `/cs status` | Show current status |
-| `/cs window <secs>` | Set capture window duration (default: 1s) |
+| `/cs window <secs>` | Set capture window duration (default: 3s) |
 | `/cs list` | List all custom filters |
 | `/cs add <text>` | Add filter manually (^starts, =exact) |
 | `/cs remove <#>` | Remove a filter by number |
@@ -153,7 +153,7 @@ Output:
 CleanStart vx.y.z:
   Filtering    : On
   Debug        : Off
-  Capture window : 1s
+  Capture window : 3s
   Custom filters : 0
   Whitelist entries : 0
   Captured messages : 42
