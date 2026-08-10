@@ -1,7 +1,8 @@
 -- CleanStart - Filter addon messages from chat
 
 local ADDON_NAME = "!CleanStart"
-local ADDON_VERSION = "1.0.0"
+-- Read from the .toc instead of a second hardcoded constant, so it can't drift.
+local ADDON_VERSION = (C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata)(ADDON_NAME, "Version") or "unknown"
 
 if not CleanStartDB then CleanStartDB = {} end
 local db = CleanStartDB
@@ -9,15 +10,13 @@ local db = CleanStartDB
 local originalAddMessage = DEFAULT_CHAT_FRAME.AddMessage
 local originalPrint = print
 
--- Login window state
 local captureActive = true
-local capturedMessages = {}  -- Stores all messages during login window
-local hookedFrames = {}  -- Track hooked frames for cleanup
-local playerLoginFired = false  -- Track if PLAYER_LOGIN has fired to prevent double-init on reload
+local capturedMessages = {}
+local hookedFrames = {}
+local playerLoginFired = false  -- guards against PLAYER_LOGIN double-firing
 
--- Message type constants
-local MSG_ADDON = "addon"      -- No ID = addon message (blocked by default)
-local MSG_SYSTEM = "system"    -- Has ID = system/player message (user choice)
+local MSG_ADDON = "addon"      -- no ID = addon message (blocked by default)
+local MSG_SYSTEM = "system"    -- has ID = system/player message (user choice)
 
 -- ─── Database Defaults ─────────────────────────────────────────────────────────
 
@@ -99,29 +98,18 @@ local function CaptureMessage(msg, msgId, r, g, b)
     
     local hasMessageId = msgId and type(msgId) == "number"
     local msgType = hasMessageId and MSG_SYSTEM or MSG_ADDON
-    
-    -- Determine default action
-    local defaultAction = "none"
-    if msgType == MSG_ADDON then
-        defaultAction = "blocked"  -- Addon messages blocked by default
-    else
-        defaultAction = "allowed"  -- System messages allowed by default
-    end
-    
-    -- Check if this message text is already in custom filters (blocked by user)
+    local defaultAction = (msgType == MSG_ADDON) and "blocked" or "allowed"
+
     local userAction = nil
     local filterType = nil
     if msgType == MSG_SYSTEM then
-        -- Check if message ID is blocked
         if IsMessageIdBlocked(msgId) then
             userAction = "blocked"
             filterType = "id"
         elseif db.customFilters then
-            -- Check text filters
             local msgLower = string.lower(msg)
             for _, filter in ipairs(db.customFilters) do
                 if string.sub(filter, 1, 1) == "=" then
-                    -- Exact match
                     local filterTextLower = string.lower(string.sub(filter, 2))
                     if msgLower == filterTextLower then
                         userAction = "blocked"
@@ -129,7 +117,6 @@ local function CaptureMessage(msg, msgId, r, g, b)
                         break
                     end
                 elseif string.sub(filter, 1, 1) == "^" then
-                    -- Starts-with match
                     local pattern = string.lower(string.sub(filter, 2))
                     if string.sub(msgLower, 1, #pattern) == pattern then
                         userAction = "blocked"
@@ -137,7 +124,6 @@ local function CaptureMessage(msg, msgId, r, g, b)
                         break
                     end
                 else
-                    -- Contains match
                     local pattern = string.lower(filter)
                     if string.find(msgLower, pattern, 1, true) then
                         userAction = "blocked"
@@ -173,13 +159,11 @@ end
 local function ShouldFilter(msg, msgId)
     if not db or not db.enabled then return false end
     if type(msg) ~= "string" then return false end
-    
-    -- Skip our own messages
+
     if string.find(msg, "CleanStart", 1, true) then
         return false
     end
-    
-    -- Check whitelist first
+
     if IsWhitelisted(msg) then
         if db and db.debug then
             originalPrint("|cFF00AAFFCleanStart:|r Whitelisted: \"" .. msg .. "\"")
@@ -187,7 +171,6 @@ local function ShouldFilter(msg, msgId)
         return false
     end
     
-    -- Check if message ID is blocked
     if IsMessageIdBlocked(msgId) then
         if db and db.debug then
             originalPrint("|cFFFF6600CleanStart:|r Blocked by ID: " .. tostring(msgId))
@@ -195,7 +178,6 @@ local function ShouldFilter(msg, msgId)
         return true
     end
     
-    -- Custom text filters (only active during capture window)
     local matched, word = MatchesCustomFilter(msg)
     if matched then
         if db and db.debug then
@@ -203,48 +185,56 @@ local function ShouldFilter(msg, msgId)
         end
         return true
     end
-    
+
     local hasMessageId = msgId and type(msgId) == "number"
-    
-    -- During capture window: block addon messages (no ID)
+
+    -- Only reached during the capture window (hooks are removed once it closes).
     if captureActive then
-        if not hasMessageId then
-            return true  -- Block addon messages during login window
-        end
-        return false  -- Allow system messages during login window
+        return not hasMessageId
     end
-    
-    -- After capture window: no filtering
+
     return false
 end
 
 -- ─── Chat Frame Hooks ──────────────────────────────────────────────────────────
+
+local function ProcessCapturedMessage(msg, msgId, r, g, b)
+    if not captureActive then return false end
+    CaptureMessage(msg, msgId, r, g, b)
+    return ShouldFilter(msg, msgId)
+end
+
+-- Fail-open: an error here must never eat a real chat message. Forward it to
+-- the normal error handler (so BugGrabber etc. still catch it) and let the
+-- message through instead of silently dropping it.
+local function ShouldBlockMessage(msg, msgId, r, g, b)
+    local ok, blockOrErr = pcall(ProcessCapturedMessage, msg, msgId, r, g, b)
+    if not ok then
+        geterrorhandler()(blockOrErr)
+        return false
+    end
+    return blockOrErr
+end
 
 local function HookChatFrame(frame)
     if frame and frame.AddMessage and not hookedFrames[frame] then
         local orig = frame.AddMessage
         hookedFrames[frame] = orig
         frame.AddMessage = function(self, msg, r, g, b, id, ...)
-            -- Only process during capture window
-            if captureActive then
-                CaptureMessage(msg, id, r, g, b)
-                if ShouldFilter(msg, id) then return end
-            end
+            if ShouldBlockMessage(msg, id, r, g, b) then return end
             orig(self, msg, r, g, b, id, ...)
         end
     end
 end
 
 local function UnhookAllFrames()
-    -- Don't unhook during combat to prevent errors
+    -- Unhooking while in combat can taint the chat frames, so defer until combat ends.
     if InCombatLockdown() then
         if db and db.debug then
             originalPrint("|cFFFF6600CleanStart:|r Cannot unhook frames while in combat, will retry later.")
         end
-        -- Schedule for after combat ends using C_Timer (doesn't require frame reference)
         C_Timer.After(1, function()
             if InCombatLockdown() then
-                -- Still in combat, retry again
                 C_Timer.After(1, UnhookAllFrames)
             else
                 UnhookAllFrames()
@@ -252,44 +242,46 @@ local function UnhookAllFrames()
         end)
         return
     end
-    
+
     for frame, orig in pairs(hookedFrames) do
         if frame then
             frame.AddMessage = orig
         end
     end
     hookedFrames = {}
-    
-    -- Restore DEFAULT_CHAT_FRAME
+
     DEFAULT_CHAT_FRAME.AddMessage = originalAddMessage
-    
-    -- Restore print
     print = originalPrint
-    
+
     if db and db.debug then
         originalPrint("|cFF00FF00CleanStart:|r Hooks removed, addon inactive.")
     end
 end
 
--- Hook DEFAULT_CHAT_FRAME immediately at file load
+-- Hooked immediately at file load, before PLAYER_LOGIN, so nothing during the
+-- capture window is missed.
 DEFAULT_CHAT_FRAME.AddMessage = function(self, msg, r, g, b, id, ...)
-    if captureActive then
-        CaptureMessage(msg, id, r, g, b)
-        if ShouldFilter(msg, id) then return end
-    end
+    if ShouldBlockMessage(msg, id, r, g, b) then return end
     originalAddMessage(self, msg, r, g, b, id, ...)
 end
--- Track that DEFAULT_CHAT_FRAME is already hooked to prevent double-hooking
 hookedFrames[DEFAULT_CHAT_FRAME] = originalAddMessage
 
--- Hook print immediately at file load
+-- Same fail-open contract as ShouldBlockMessage.
+local function ShouldBlockPrint(...)
+    if not captureActive then return false end
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
+    local msg = table.concat(parts, " ")
+    CaptureMessage(msg, nil, 1, 1, 1)
+    return ShouldFilter(msg, nil)
+end
+
 print = function(...)
-    if captureActive then
-        local parts = {}
-        for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
-        local msg = table.concat(parts, " ")
-        CaptureMessage(msg, nil, 1, 1, 1)
-        if ShouldFilter(msg, nil) then return end
+    local ok, block = pcall(ShouldBlockPrint, ...)
+    if not ok then
+        geterrorhandler()(block)
+    elseif block then
+        return
     end
     originalPrint(...)
 end
@@ -305,43 +297,52 @@ local filtersListFrame = nil
 
 -- ─── ESC Key Handling ──────────────────────────────────────────────────────────
 
--- Create a proxy frame for ESC handling that closes windows one at a time
--- This must be defined before the GUI functions that reference it
+-- Proxy frame that closes our windows one at a time on Escape (topmost first).
+-- Must be defined before the GUI functions that reference it.
 local escProxyFrame = CreateFrame("Frame", "CleanStartEscProxy", UIParent)
 escProxyFrame:Hide()
 escProxyFrame:SetScript("OnHide", function(self)
-    -- Check which windows are visible before closing
     local hasEdit = editDialog and editDialog:IsShown()
     local hasFilters = filtersListFrame and filtersListFrame:IsShown()
     local hasGui = guiFrame and guiFrame:IsShown()
-    
-    -- Close windows one at a time, starting with the topmost (editDialog first)
+
     if hasEdit then
         editDialog:Hide()
-        self:Show()  -- Re-show proxy for next ESC
+        self:Show()
     elseif hasFilters then
         filtersListFrame:Hide()
-        self:Show()  -- Re-show proxy for next ESC
+        self:Show()
     elseif hasGui then
         guiFrame:Hide()
-        -- Don't re-show - all windows closed
     end
 end)
 
--- Register the proxy frame with UISpecialFrames
 table.insert(UISpecialFrames, "CleanStartEscProxy")
+
+-- Keeps escProxyFrame in sync with our windows. Without this, closing a
+-- window via its "Close" button (instead of Escape) leaves escProxyFrame
+-- registered as shown, so the *next unrelated* Escape press gets silently
+-- swallowed by it instead of closing whatever the player actually meant to.
+local function SyncEscProxy()
+    local anyShown = (guiFrame and guiFrame:IsShown())
+        or (filtersListFrame and filtersListFrame:IsShown())
+        or (editDialog and editDialog:IsShown())
+    if anyShown then
+        escProxyFrame:Show()
+    else
+        escProxyFrame:Hide()
+    end
+end
 
 local function CreateGUI()
     if guiFrame then return end
-    
-    -- Main frame
+
     guiFrame = CreateFrame("Frame", "CleanStartGUI", UIParent, "BasicFrameTemplateWithInset")
     guiFrame:SetSize(600, 500)
     guiFrame:SetPoint("CENTER")
     guiFrame:SetMovable(true)
     guiFrame:EnableMouse(true)
     guiFrame:SetResizable(true)
-    -- Set resize bounds if available (retail API)
     if guiFrame.SetResizeBounds then
         local maxW = UIParent:GetWidth() or 1920
         local maxH = UIParent:GetHeight() or 1080
@@ -352,13 +353,12 @@ local function CreateGUI()
     guiFrame:SetScript("OnDragStop", guiFrame.StopMovingOrSizing)
     guiFrame:SetClampedToScreen(true)
     guiFrame:Hide()
-    
-    -- Title
+    guiFrame:HookScript("OnHide", SyncEscProxy)
+
     guiFrame.title = guiFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     guiFrame.title:SetPoint("TOP", guiFrame, "TOP", 0, -5)
     guiFrame.title:SetText("CleanStart - Captured Messages")
-    
-    -- Resize handle
+
     local resizeHandle = CreateFrame("Button", nil, guiFrame)
     resizeHandle:SetPoint("BOTTOMRIGHT", guiFrame, "BOTTOMRIGHT", -5, 5)
     resizeHandle:SetSize(16, 16)
@@ -371,25 +371,21 @@ local function CreateGUI()
     resizeHandle:SetScript("OnMouseUp", function()
         guiFrame:StopMovingOrSizing()
     end)
-    
-    -- Update scroll child and rows on size change
+
     guiFrame:SetScript("OnSizeChanged", function()
         if scrollChild and scrollFrame then
             scrollChild:SetWidth(scrollFrame:GetWidth() - 20)
-            -- Only refresh if GUI is shown and has messages
             if guiFrame:IsShown() and #capturedMessages > 0 then
                 CleanStart_RefreshMessageList()
             end
         end
     end)
-    
-    -- Button container frame (positioned higher)
+
     local buttonFrame = CreateFrame("Frame", nil, guiFrame)
     buttonFrame:SetPoint("BOTTOMLEFT", guiFrame, "BOTTOMLEFT", 10, 30)
     buttonFrame:SetPoint("BOTTOMRIGHT", guiFrame, "BOTTOMRIGHT", -10, 30)
     buttonFrame:SetHeight(25)
-    
-    -- Filters List button (leftmost)
+
     local filtersListButton = CreateFrame("Button", nil, buttonFrame, "UIPanelButtonTemplate")
     filtersListButton:SetPoint("LEFT", buttonFrame, "LEFT", 0, 0)
     filtersListButton:SetSize(90, 25)
@@ -397,8 +393,7 @@ local function CreateGUI()
     filtersListButton:SetScript("OnClick", function()
         CleanStart_ToggleFiltersList()
     end)
-    
-    -- Clear Filters button
+
     local clearFiltersButton = CreateFrame("Button", nil, buttonFrame, "UIPanelButtonTemplate")
     clearFiltersButton:SetPoint("LEFT", filtersListButton, "RIGHT", 10, 0)
     clearFiltersButton:SetSize(90, 25)
@@ -409,34 +404,29 @@ local function CreateGUI()
         CleanStart_RefreshMessageList()
         originalPrint("|cFF00FF00CleanStart:|r All filters cleared.")
     end)
-    
-    -- Close button
+
     local closeButton = CreateFrame("Button", nil, buttonFrame, "UIPanelButtonTemplate")
     closeButton:SetPoint("RIGHT", buttonFrame, "RIGHT", -20, 0)
     closeButton:SetSize(70, 25)
     closeButton:SetText("Close")
     closeButton:SetScript("OnClick", function() guiFrame:Hide() end)
-    
-    -- Scroll frame (ends higher to allow space for resize handle)
+
     scrollFrame = CreateFrame("ScrollFrame", "CleanStartScrollFrame", guiFrame, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", guiFrame, "TOPLEFT", 10, -30)
     scrollFrame:SetPoint("BOTTOMRIGHT", guiFrame, "BOTTOMRIGHT", -30, 60)
-    
-    -- Scroll child
+
     scrollChild = CreateFrame("Frame", "CleanStartScrollChild", scrollFrame)
     scrollChild:SetSize(560, 1)
     scrollFrame:SetScrollChild(scrollChild)
-    
-    -- Status text
+
     guiFrame.statusText = guiFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     guiFrame.statusText:SetPoint("BOTTOMLEFT", guiFrame, "BOTTOMLEFT", 15, 10)
     guiFrame.statusText:SetText("")
 end
 
--- Create Edit Dialog
 local function CreateEditDialog()
     if editDialog then return end
-    
+
     editDialog = CreateFrame("Frame", "CleanStartEditDialog", UIParent, "BasicFrameTemplateWithInset")
     editDialog:SetSize(500, 400)
     editDialog:SetPoint("CENTER")
@@ -447,31 +437,28 @@ local function CreateEditDialog()
     editDialog:SetScript("OnDragStop", editDialog.StopMovingOrSizing)
     editDialog:SetClampedToScreen(true)
     editDialog:Hide()
+    editDialog:HookScript("OnHide", SyncEscProxy)
     editDialog:SetFrameStrata("DIALOG")
-    
-    -- Title
+
     editDialog.title = editDialog:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     editDialog.title:SetPoint("TOP", editDialog, "TOP", 0, -5)
     editDialog.title:SetText("Custom Filter")
-    
-    -- Instructions
+
     editDialog.instructions = editDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     editDialog.instructions:SetPoint("TOP", editDialog, "TOP", 15, -30)
     editDialog.instructions:SetText("Edit the filter text.\n Add prefix ^ for starts-with match, or no prefix for contains match")
-    
-    -- Block by ID checkbox (only shown for system messages with ID)
+
     editDialog.blockByIdCheckbox = CreateFrame("CheckButton", "CleanStartBlockByIdCheck", editDialog, "ChatConfigCheckButtonTemplate")
     editDialog.blockByIdCheckbox:SetPoint("BOTTOMLEFT", editDialog, "BOTTOMLEFT", 15, 60)
     editDialog.blockByIdCheckbox.Text = editDialog.blockByIdCheckbox:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     editDialog.blockByIdCheckbox.Text:SetPoint("LEFT", editDialog.blockByIdCheckbox, "RIGHT", 5, 0)
     editDialog.blockByIdCheckbox.Text:SetText("Block by Message ID (blocks all messages with this system ID)")
     editDialog.blockByIdCheckbox:SetHitRectInsets(0, -editDialog.blockByIdCheckbox.Text:GetStringWidth(), 0, 0)
-    
-    -- Multi-line edit box using ScrollFrame
+
     local scrollFrameEdit = CreateFrame("ScrollFrame", "CleanStartEditScrollFrame", editDialog, "UIPanelScrollFrameTemplate")
     scrollFrameEdit:SetPoint("TOPLEFT", editDialog, "TOPLEFT", 15, -90)
     scrollFrameEdit:SetPoint("BOTTOMRIGHT", editDialog, "BOTTOMRIGHT", -35, 90)
-    
+
     local editBox = CreateFrame("EditBox", "CleanStartEditBox", scrollFrameEdit)
     editBox:SetSize(450, 200)
     editBox:SetMultiLine(true)
@@ -480,15 +467,13 @@ local function CreateEditDialog()
     editBox:SetScript("OnEscapePressed", function() editDialog:Hide() end)
     scrollFrameEdit:SetScrollChild(editBox)
     editDialog.editBox = editBox
-    
-    -- Cancel button
+
     local cancelBtn = CreateFrame("Button", nil, editDialog, "UIPanelButtonTemplate")
     cancelBtn:SetPoint("BOTTOMRIGHT", editDialog, "BOTTOMRIGHT", -10, 10)
     cancelBtn:SetSize(70, 25)
     cancelBtn:SetText("Cancel")
     cancelBtn:SetScript("OnClick", function() editDialog:Hide() end)
-    
-    -- OK button
+
     local okBtn = CreateFrame("Button", nil, editDialog, "UIPanelButtonTemplate")
     okBtn:SetPoint("RIGHT", cancelBtn, "LEFT", -10, 0)
     okBtn:SetSize(70, 25)
@@ -510,8 +495,7 @@ local function ShowEditDialog(msgText, msgId, onConfirm)
     editDialog.editBox:HighlightText()
     editDialog.editBox:SetFocus()
     editDialog.onConfirm = onConfirm
-    
-    -- Show/hide block by ID checkbox based on whether message has an ID
+
     if msgId and type(msgId) == "number" then
         editDialog.blockByIdCheckbox:Show()
         editDialog.blockByIdCheckbox:SetChecked(false)
@@ -522,13 +506,12 @@ local function ShowEditDialog(msgText, msgId, onConfirm)
     end
     
     editDialog:Show()
-    escProxyFrame:Show()  -- Enable ESC handling
+    escProxyFrame:Show()
 end
 
 function CleanStart_RefreshMessageList()
     if not scrollChild then return end
-    
-    -- Clear existing rows
+
     for _, row in ipairs(messageRows) do
         if row.frame then
             row.frame:Hide()
@@ -536,13 +519,12 @@ function CleanStart_RefreshMessageList()
         end
     end
     messageRows = {}
-    
-    -- Count by type
+
     local addonCount = 0
     local systemCount = 0
     local blockedCount = 0
     local allowedCount = 0
-    
+
     for _, msg in ipairs(capturedMessages) do
         if msg.msgType == MSG_ADDON then
             addonCount = addonCount + 1
@@ -555,39 +537,35 @@ function CleanStart_RefreshMessageList()
             end
         end
     end
-    
+
     guiFrame.statusText:SetText(string.format(
         "Addon: %d (blocked during login) | System: %d (Blocked: %d)",
         addonCount, systemCount, blockedCount))
-    
-    -- Create rows
+
     local yOffset = -5
     local rowHeight = 75
-    local maxDisplay = 100  -- Limit for performance
-    
+    local maxDisplay = 100  -- cap for render performance
+
     local messagesToShow = #capturedMessages
     local startIndex = math.max(1, messagesToShow - maxDisplay + 1)
-    
+
     for i = startIndex, messagesToShow do
         local msg = capturedMessages[i]
         local rowIndex = i - startIndex + 1
-        
-        -- Create row frame with dynamic width
+
         local rowFrame = CreateFrame("Frame", "CleanStartRow" .. rowIndex, scrollChild)
         rowFrame:SetHeight(rowHeight)
         rowFrame:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 0, yOffset)
         rowFrame:SetPoint("TOPRIGHT", scrollChild, "TOPRIGHT", 10, yOffset)
-        
-        -- Background
+
         rowFrame.bg = rowFrame:CreateTexture(nil, "BACKGROUND")
         rowFrame.bg:SetAllPoints()
         if msg.msgType == MSG_ADDON then
-            rowFrame.bg:SetColorTexture(0.4, 0.2, 0.2, 0.3)  -- Reddish for addon
+            rowFrame.bg:SetColorTexture(0.4, 0.2, 0.2, 0.3)
         else
-            rowFrame.bg:SetColorTexture(0.2, 0.4, 0.2, 0.3)  -- Greenish for system
+            rowFrame.bg:SetColorTexture(0.2, 0.4, 0.2, 0.3)
         end
-        
-        -- Message type indicator
+
         local typeText = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         typeText:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -3)
         if msg.msgType == MSG_ADDON then
@@ -595,8 +573,7 @@ function CleanStart_RefreshMessageList()
         else
             typeText:SetText("|cFF66FF66[SYSTEM]|r ID: " .. tostring(msg.id))
         end
-        
-        -- Message text (full width, above buttons)
+
         local msgText = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
         msgText:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -20)
         msgText:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -25, 30)
@@ -608,33 +585,26 @@ function CleanStart_RefreshMessageList()
             displayText = string.sub(displayText, 1, 497) .. "..."
         end
         msgText:SetText(displayText)
-        
-        -- Action buttons (only for system messages)
+
         if msg.msgType == MSG_SYSTEM then
-            -- Current status indicator (top right)
             local statusText = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
             statusText:SetPoint("TOPRIGHT", rowFrame, "TOPRIGHT", -5, -3)
-            -- Check if this message is blocked by any filter
             local isBlocked = false
             local blockType = nil
-            
-            -- Check if blocked by ID first
+
             if IsMessageIdBlocked(msg.id) then
                 isBlocked = true
                 blockType = "id"
             else
-                -- Check text filters
                 local msgTextLower = string.lower(msg.text)
                 for _, filter in ipairs(db.customFilters) do
                     if string.sub(filter, 1, 1) == "=" then
-                        -- Exact match
                         if string.lower(string.sub(filter, 2)) == msgTextLower then
                             isBlocked = true
                             blockType = "exact"
                             break
                         end
                     elseif string.sub(filter, 1, 1) == "^" then
-                        -- Starts-with match
                         local pattern = string.lower(string.sub(filter, 2))
                         if string.sub(msgTextLower, 1, #pattern) == pattern then
                             isBlocked = true
@@ -642,7 +612,6 @@ function CleanStart_RefreshMessageList()
                             break
                         end
                     else
-                        -- Contains match
                         local pattern = string.lower(filter)
                         if string.find(msgTextLower, pattern, 1, true) then
                             isBlocked = true
@@ -652,7 +621,7 @@ function CleanStart_RefreshMessageList()
                     end
                 end
             end
-            
+
             if isBlocked then
                 statusText:SetText("|cFFFF0000BLOCKED (" .. blockType .. ")|r")
                 msg.userAction = "blocked"
@@ -662,17 +631,15 @@ function CleanStart_RefreshMessageList()
                 msg.userAction = nil
                 msg.filterType = nil
             end
-            
-            -- Custom button (opens edit dialog) - rightmost
+
+            -- Rightmost: Custom, then Block, then Allow.
             local customBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
             customBtn:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -5, 5)
             customBtn:SetSize(70, 22)
             customBtn:SetText("Custom")
             customBtn:SetScript("OnClick", function()
-                -- Show edit dialog with the message text and ID
                 ShowEditDialog(msg.text, msg.id, function(filterText, blockById)
                     if blockById and msg.id then
-                        -- Block by message ID
                         local alreadyBlocked = false
                         for _, blockedId in ipairs(db.blockedMessageIds) do
                             if blockedId == msg.id then
@@ -689,7 +656,6 @@ function CleanStart_RefreshMessageList()
                             originalPrint("|cFFFF6600CleanStart:|r Blocked by ID: " .. msg.id)
                         end
                     elseif filterText and filterText ~= "" then
-                        -- Add the custom text filter
                         local alreadyBlocked = false
                         for _, filter in ipairs(db.customFilters) do
                             if filter == filterText then
@@ -701,7 +667,6 @@ function CleanStart_RefreshMessageList()
                             table.insert(db.customFilters, filterText)
                         end
                         msg.userAction = "blocked"
-                        -- Determine filter type for display
                         if string.sub(filterText, 1, 1) == "=" then
                             msg.filterType = "exact"
                         elseif string.sub(filterText, 1, 1) == "^" then
@@ -716,14 +681,12 @@ function CleanStart_RefreshMessageList()
                     CleanStart_RefreshMessageList()
                 end)
             end)
-            
-            -- Block button (exact match)
+
             local blockBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
             blockBtn:SetPoint("RIGHT", customBtn, "LEFT", -5, 0)
             blockBtn:SetSize(70, 22)
             blockBtn:SetText("Block")
             blockBtn:SetScript("OnClick", function()
-                -- Add exact match filter
                 local filterText = "=" .. msg.text
                 local alreadyBlocked = false
                 for _, filter in ipairs(db.customFilters) do
@@ -742,37 +705,31 @@ function CleanStart_RefreshMessageList()
                     originalPrint("|cFFFF6600CleanStart:|r Blocked (exact): \"" .. msg.text .. "\"")
                 end
             end)
-            
-            -- Allow button (leftmost)
+
             local allowBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
             allowBtn:SetPoint("RIGHT", blockBtn, "LEFT", -5, 0)
             allowBtn:SetSize(70, 22)
             allowBtn:SetText("Allow")
             allowBtn:SetScript("OnClick", function()
-                -- Remove any filters related to this message
                 local msgTextLower = string.lower(msg.text)
                 for j = #db.customFilters, 1, -1 do
                     local filter = db.customFilters[j]
-                    -- Check exact match filter
                     if string.sub(filter, 1, 1) == "=" then
                         if string.lower(string.sub(filter, 2)) == msgTextLower then
                             table.remove(db.customFilters, j)
                         end
-                    -- Check starts-with filter - remove if message starts with the filter pattern
                     elseif string.sub(filter, 1, 1) == "^" then
                         local pattern = string.lower(string.sub(filter, 2))
                         if string.sub(msgTextLower, 1, #pattern) == pattern then
                             table.remove(db.customFilters, j)
                         end
                     else
-                        -- Contains match
                         local pattern = string.lower(filter)
                         if string.find(msgTextLower, pattern, 1, true) then
                             table.remove(db.customFilters, j)
                         end
                     end
                 end
-                -- Remove blocked ID if present
                 if msg.id then
                     for j = #db.blockedMessageIds, 1, -1 do
                         if db.blockedMessageIds[j] == msg.id then
@@ -788,17 +745,15 @@ function CleanStart_RefreshMessageList()
                 end
             end)
         else
-            -- Addon message - show "blocked by default" at top right
             local statusText = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
             statusText:SetPoint("TOPRIGHT", rowFrame, "TOPRIGHT", -5, -3)
             statusText:SetText("|cFFFF6666Blocked by default|r")
         end
-        
+
         table.insert(messageRows, {frame = rowFrame, msg = msg})
         yOffset = yOffset - rowHeight - 2
     end
-    
-    -- Update scroll child height
+
     local totalHeight = math.abs(yOffset) + 5
     scrollChild:SetHeight(math.max(totalHeight, 1))
 end
@@ -825,8 +780,7 @@ local filterRows = {}
 
 local function RefreshFiltersList()
     if not filtersListScrollChild then return end
-    
-    -- Clear existing rows
+
     for _, row in ipairs(filterRows) do
         if row.frame then
             row.frame:Hide()
@@ -837,8 +791,7 @@ local function RefreshFiltersList()
     
     local yOffset = -5
     local rowHeight = 75
-    
-    -- Text filters
+
     for i, filter in ipairs(db.customFilters) do
         local filterType = "contains"
         local displayText = filter
@@ -849,23 +802,20 @@ local function RefreshFiltersList()
             filterType = "starts"
             displayText = string.sub(filter, 2)
         end
-        
+
         local rowFrame = CreateFrame("Frame", "CleanStartFilterRow" .. i, filtersListScrollChild)
         rowFrame:SetHeight(rowHeight)
         rowFrame:SetPoint("TOPLEFT", filtersListScrollChild, "TOPLEFT", 0, yOffset)
         rowFrame:SetPoint("TOPRIGHT", filtersListScrollChild, "TOPRIGHT", 10, yOffset)
-        
-        -- Background
+
         rowFrame.bg = rowFrame:CreateTexture(nil, "BACKGROUND")
         rowFrame.bg:SetAllPoints()
         rowFrame.bg:SetColorTexture(0.2, 0.3, 0.5, 0.3)
-        
-        -- Filter type indicator
+
         local typeText = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         typeText:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -3)
         typeText:SetText("|cFF00AAFF[" .. string.upper(filterType) .. " FILTER]|r")
-        
-        -- Filter text (full width, above buttons)
+
         local filterTextWidget = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
         filterTextWidget:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -20)
         filterTextWidget:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -25, 30)
@@ -877,14 +827,12 @@ local function RefreshFiltersList()
             displayTextTruncated = string.sub(displayTextTruncated, 1, 497) .. "..."
         end
         filterTextWidget:SetText(displayTextTruncated)
-        
-        -- Edit button (bottom right area)
+
         local editBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
         editBtn:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -5, 5)
         editBtn:SetSize(70, 22)
         editBtn:SetText("Edit")
         editBtn:SetScript("OnClick", function()
-            -- Use the same edit dialog as the Custom button
             ShowEditDialog(displayText, nil, function(newFilterText, blockById)
                 if newFilterText and newFilterText ~= "" then
                     db.customFilters[i] = newFilterText
@@ -894,8 +842,7 @@ local function RefreshFiltersList()
                 end
             end)
         end)
-        
-        -- Remove button
+
         local removeBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
         removeBtn:SetPoint("RIGHT", editBtn, "LEFT", -5, 0)
         removeBtn:SetSize(70, 22)
@@ -906,29 +853,25 @@ local function RefreshFiltersList()
             CleanStart_RefreshMessageList()
             originalPrint("|cFF00FF00CleanStart:|r Filter removed.")
         end)
-        
+
         table.insert(filterRows, {frame = rowFrame, filter = filter, filterType = "text", index = i})
         yOffset = yOffset - rowHeight - 2
     end
-    
-    -- Blocked Message IDs
+
     for i, msgId in ipairs(db.blockedMessageIds) do
         local rowFrame = CreateFrame("Frame", "CleanStartBlockedIdRow" .. i, filtersListScrollChild)
         rowFrame:SetHeight(rowHeight)
         rowFrame:SetPoint("TOPLEFT", filtersListScrollChild, "TOPLEFT", 0, yOffset)
         rowFrame:SetPoint("TOPRIGHT", filtersListScrollChild, "TOPRIGHT", 10, yOffset)
-        
-        -- Background
+
         rowFrame.bg = rowFrame:CreateTexture(nil, "BACKGROUND")
         rowFrame.bg:SetAllPoints()
         rowFrame.bg:SetColorTexture(0.5, 0.3, 0.2, 0.3)
-        
-        -- Filter type indicator
+
         local typeText = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         typeText:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -3)
         typeText:SetText("|cFFFF6600[BLOCKED MESSAGE ID]|r")
-        
-        -- Filter text (full width, above buttons)
+
         local filterTextWidget = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
         filterTextWidget:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -20)
         filterTextWidget:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -25, 30)
@@ -936,15 +879,14 @@ local function RefreshFiltersList()
         filterTextWidget:SetJustifyV("TOP")
         filterTextWidget:SetWordWrap(true)
         filterTextWidget:SetText("Message ID: " .. tostring(msgId) .. "\n\nThis blocks all system messages with this ID.")
-        
-        -- Edit button (disabled for ID filters)
+
+        -- Edit is disabled: ID filters have nothing to edit, only remove.
         local editBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
         editBtn:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -125, 5)
         editBtn:SetSize(70, 22)
         editBtn:SetText("Edit")
         editBtn:Disable()
-        
-        -- Remove button
+
         local removeBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
         removeBtn:SetPoint("LEFT", editBtn, "RIGHT", 5, 0)
         removeBtn:SetSize(70, 22)
@@ -955,33 +897,30 @@ local function RefreshFiltersList()
             CleanStart_RefreshMessageList()
             originalPrint("|cFF00FF00CleanStart:|r Blocked ID removed.")
         end)
-        
+
         table.insert(filterRows, {frame = rowFrame, filterId = msgId, filterType = "id", index = i})
         yOffset = yOffset - rowHeight - 2
     end
-    
-    -- No filters message
+
     if #db.customFilters == 0 and #db.blockedMessageIds == 0 then
         local noFiltersText = filtersListScrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         noFiltersText:SetPoint("TOP", filtersListScrollChild, "TOP", 0, -20)
         noFiltersText:SetText("|cFFAAAAAANo filters configured.|r\n\nUse the Block/Custom buttons on messages to create filters.")
     end
-    
-    -- Update scroll child height
+
     local totalHeight = math.abs(yOffset) + 5
     filtersListScrollChild:SetHeight(math.max(totalHeight, 1))
 end
 
 local function CreateFiltersListWindow()
     if filtersListFrame then return end
-    
+
     filtersListFrame = CreateFrame("Frame", "CleanStartFiltersListGUI", UIParent, "BasicFrameTemplateWithInset")
     filtersListFrame:SetSize(600, 500)
     filtersListFrame:SetPoint("CENTER")
     filtersListFrame:SetMovable(true)
     filtersListFrame:EnableMouse(true)
     filtersListFrame:SetResizable(true)
-    -- Set resize bounds if available (retail API)
     if filtersListFrame.SetResizeBounds then
         local maxW = UIParent:GetWidth() or 1920
         local maxH = UIParent:GetHeight() or 1080
@@ -993,13 +932,12 @@ local function CreateFiltersListWindow()
     filtersListFrame:SetClampedToScreen(true)
     filtersListFrame:SetFrameStrata("HIGH")
     filtersListFrame:Hide()
-    
-    -- Title
+    filtersListFrame:HookScript("OnHide", SyncEscProxy)
+
     filtersListFrame.title = filtersListFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     filtersListFrame.title:SetPoint("TOP", filtersListFrame, "TOP", 0, -5)
     filtersListFrame.title:SetText("CleanStart - Filters List")
-    
-    -- Resize handle
+
     local resizeHandle = CreateFrame("Button", nil, filtersListFrame)
     resizeHandle:SetPoint("BOTTOMRIGHT", filtersListFrame, "BOTTOMRIGHT", -5, 5)
     resizeHandle:SetSize(16, 16)
@@ -1012,42 +950,35 @@ local function CreateFiltersListWindow()
     resizeHandle:SetScript("OnMouseUp", function()
         filtersListFrame:StopMovingOrSizing()
     end)
-    
-    -- Update scroll child and rows on size change
+
     filtersListFrame:SetScript("OnSizeChanged", function()
         if filtersListScrollChild and filtersListScrollFrame then
             filtersListScrollChild:SetWidth(filtersListScrollFrame:GetWidth() - 20)
-            -- Only refresh if GUI is shown and has filters
             if filtersListFrame:IsShown() and (#db.customFilters > 0 or #db.blockedMessageIds > 0) then
                 RefreshFiltersList()
             end
         end
     end)
-    
-    -- Button container frame (positioned higher)
+
     local buttonFrame = CreateFrame("Frame", nil, filtersListFrame)
     buttonFrame:SetPoint("BOTTOMLEFT", filtersListFrame, "BOTTOMLEFT", 10, 30)
     buttonFrame:SetPoint("BOTTOMRIGHT", filtersListFrame, "BOTTOMRIGHT", -10, 30)
     buttonFrame:SetHeight(25)
-    
-    -- Close button
+
     local closeButton = CreateFrame("Button", nil, buttonFrame, "UIPanelButtonTemplate")
     closeButton:SetPoint("RIGHT", buttonFrame, "RIGHT", -20, 0)
     closeButton:SetSize(70, 25)
     closeButton:SetText("Close")
     closeButton:SetScript("OnClick", function() filtersListFrame:Hide() end)
-    
-    -- Status text
+
     filtersListFrame.statusText = filtersListFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     filtersListFrame.statusText:SetPoint("BOTTOMLEFT", filtersListFrame, "BOTTOMLEFT", 15, 10)
     filtersListFrame.statusText:SetText("")
-    
-    -- Scroll frame (ends higher to allow space for resize handle)
+
     filtersListScrollFrame = CreateFrame("ScrollFrame", "CleanStartFiltersListScrollFrame", filtersListFrame, "UIPanelScrollFrameTemplate")
     filtersListScrollFrame:SetPoint("TOPLEFT", filtersListFrame, "TOPLEFT", 10, -30)
     filtersListScrollFrame:SetPoint("BOTTOMRIGHT", filtersListFrame, "BOTTOMRIGHT", -30, 60)
-    
-    -- Scroll child
+
     filtersListScrollChild = CreateFrame("Frame", "CleanStartFiltersListScrollChild", filtersListScrollFrame)
     filtersListScrollChild:SetSize(560, 1)
     filtersListScrollFrame:SetScrollChild(filtersListScrollChild)
@@ -1057,21 +988,48 @@ function CleanStart_ToggleFiltersList()
     if not filtersListFrame then
         CreateFiltersListWindow()
     end
-    
+
     if filtersListFrame:IsShown() then
         filtersListFrame:Hide()
     else
-        -- Update status text
         filtersListFrame.statusText:SetText(string.format(
             "Text Filters: %d | Blocked IDs: %d",
             #db.customFilters, #db.blockedMessageIds))
         RefreshFiltersList()
         filtersListFrame:Show()
-        escProxyFrame:Show()  -- Enable ESC handling
+        escProxyFrame:Show()
     end
 end
 
 -- ─── Event Handler ─────────────────────────────────────────────────────────────
+
+local function CloseCaptureWindow()
+    captureActive = false
+    UnhookAllFrames()
+    if db.debug then
+        originalPrint("|cFF00FF00CleanStart:|r Capture window closed.")
+        originalPrint("|cFF00FF00CleanStart:|r Captured " .. #capturedMessages .. " messages. Use /cs to review.")
+    end
+end
+
+-- Starts the login capture window, deferring the close by 1s at a time while
+-- the player is in combat so UnhookAllFrames doesn't have to fight taint.
+local function StartCaptureWindowTimer()
+    if InCombatLockdown() then
+        if db.debug then
+            originalPrint("|cFFFF6600CleanStart:|r In combat, delaying capture window close.")
+        end
+        C_Timer.After(1, function()
+            if InCombatLockdown() then
+                C_Timer.After(1, CloseCaptureWindow)
+            else
+                CloseCaptureWindow()
+            end
+        end)
+    else
+        C_Timer.After(db.blockWindow, CloseCaptureWindow)
+    end
+end
 
 local frame = CreateFrame("Frame", "CleanStartFrame")
 
@@ -1080,53 +1038,27 @@ frame:SetScript("OnEvent", function(self, event, ...)
         -- Prevent double-init on reload
         if playerLoginFired then return end
         playerLoginFired = true
-        
-        -- Clear captured messages from any previous session
+
         capturedMessages = {}
-        
-        -- Hook additional chat frames (DEFAULT_CHAT_FRAME and print already hooked at file load)
+
+        -- A /reload mid-instance isn't a real login - no login spam to catch,
+        -- and Blizzard restricts chat history access while instanced. Skip
+        -- the capture window instead of briefly filtering live chat.
+        if IsInInstance() then
+            captureActive = false
+            UnhookAllFrames()
+            if db.debug then
+                originalPrint("|cFF00FF00CleanStart:|r Reload detected inside an instance, capture skipped.")
+            end
+            return
+        end
+
+        -- DEFAULT_CHAT_FRAME and print were already hooked at file load.
         for i = 1, NUM_CHAT_WINDOWS or 10 do
             HookChatFrame(_G["ChatFrame" .. i])
         end
-        
-        -- Set up login window timer for capture
-        -- Skip if player is in combat (will handle on next event or manual reload)
-        if InCombatLockdown() then
-            if db.debug then
-                originalPrint("|cFFFF6600CleanStart:|r In combat, delaying capture window cleanup.")
-            end
-            -- Schedule for after combat ends using C_Timer
-            C_Timer.After(1, function()
-                if InCombatLockdown() then
-                    -- Still in combat, retry again
-                    C_Timer.After(1, function()
-                        captureActive = false
-                        UnhookAllFrames()
-                        if db.debug then
-                            originalPrint("|cFF00FF00CleanStart:|r Capture window closed (delayed due to combat).")
-                            originalPrint("|cFF00FF00CleanStart:|r Captured " .. #capturedMessages .. " messages. Use /cs to review.")
-                        end
-                    end)
-                else
-                    captureActive = false
-                    UnhookAllFrames()
-                    if db.debug then
-                        originalPrint("|cFF00FF00CleanStart:|r Capture window closed (delayed due to combat).")
-                        originalPrint("|cFF00FF00CleanStart:|r Captured " .. #capturedMessages .. " messages. Use /cs to review.")
-                    end
-                end
-            end)
-        else
-            C_Timer.After(db.blockWindow, function()
-                captureActive = false
-                -- Unhook all frames after capture window
-                UnhookAllFrames()
-                if db.debug then
-                    originalPrint("|cFF00FF00CleanStart:|r Capture window closed (" .. db.blockWindow .. "s).")
-                    originalPrint("|cFF00FF00CleanStart:|r Captured " .. #capturedMessages .. " messages. Use /cs to review.")
-                end
-            end)
-        end
+
+        StartCaptureWindowTimer()
 
     elseif event == "ADDON_LOADED" then
         local name = ...
@@ -1280,7 +1212,6 @@ function SlashCommandHandler(input)
         originalPrint("  /cs debug        - Toggle debug output")
 
     else
-        -- Default: show GUI
         CleanStart_ToggleGUI()
     end
 end

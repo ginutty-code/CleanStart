@@ -1,8 +1,8 @@
-## Interface: 120007
+## Interface: 120007, 121000
 ## Title: !CleanStart
 ## Notes: Captures login messages and provides a GUI to review and manage them
 ## Author: Ginutty
-## Version: 1.1.1
+## Version: 1.2.0
 ## SavedVariables: CleanStartDB
 ## IconTexture: 655994
 

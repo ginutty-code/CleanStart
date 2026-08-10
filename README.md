@@ -14,6 +14,7 @@ A World of Warcraft addon that captures all messages during login and provides a
 - **Whitelist System**: Protect important messages from being filtered
 - **Debug Mode**: See detailed information about message processing
 - **Combat-Safe Reload**: Safely handles `/reload` during combat - delays cleanup until combat ends
+- **Instance-Safe Reload**: If you `/reload` while already inside a dungeon or raid, the capture window is skipped entirely instead of briefly running against live chat
 - **Lightweight**: Minimal impact on game performance
 
 ## Installation
@@ -28,6 +29,8 @@ A World of Warcraft addon that captures all messages during login and provides a
 ### Login Window Capture
 
 When you log in, the addon captures ALL chat messages during a short window (default 1 second). Addon messages are blocked during this window, while system messages are allowed through.
+
+If `/reload` is used while you're already inside a dungeon or raid, there's no login spam to catch, so CleanStart detects this and skips the capture window entirely rather than running it against live instance chat.
 
 ### Message Types
 
@@ -147,7 +150,7 @@ Settings are saved per-account in `SavedVariables` and persist between sessions:
 ```
 Output:
 ```
-CleanStart v1.0.0:
+CleanStart vx.y.z:
   Filtering    : On
   Debug        : Off
   Capture window : 1s
@@ -172,13 +175,7 @@ The exact text of that message will be added to your custom filters.
 ## Compatibility
 
 - Works with all chat frames with the **default interface**
-- Not compatible with ElvUI - message capture may be incomplete or inconsistent when ElvUI is active
-- Combat reload safe: If you use `/reload` while in combat, the addon will gracefully delay its cleanup operations until after combat ends
-- No known conflicts
-
-## Author
-
-**Ginutty**
+- Not fully compatible with ElvUI - message capture may be incomplete or inconsistent when ElvUI is active
 
 ## License
 
