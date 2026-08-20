@@ -1,4 +1,4 @@
-## Interface: 120007, 121000
+## Interface: 120100, 120105
 ## Title: !CleanStart
 ## Notes: Captures login messages and provides a GUI to review and manage them
 ## Author: Ginutty
