@@ -12,7 +12,8 @@ local originalPrint = print
 
 local captureActive = true
 local capturedMessages = {}
-local hookedFrames = {}
+local hookedAddMessage         -- the exact closure we put on DEFAULT_CHAT_FRAME.AddMessage
+local hookedPrint              -- the exact closure we put on the global print
 local playerLoginFired = false  -- guards against PLAYER_LOGIN double-firing
 
 local MSG_ADDON = "addon"      -- no ID = addon message (blocked by default)
@@ -27,6 +28,7 @@ local function EnsureDefaults()
     if not db.customFilters then db.customFilters = {} end
     if not db.whitelist then db.whitelist = {} end
     if not db.blockedMessageIds then db.blockedMessageIds = {} end
+    if not db.addonWhitelist then db.addonWhitelist = {} end
 end
 
 -- ─── Filter Matching Functions ─────────────────────────────────────────────────
@@ -66,13 +68,27 @@ local function MatchesCustomFilter(msg)
     return false
 end
 
+-- Whitelist entries use the same prefix syntax as custom filters:
+--   =text  exact match      ^text  starts-with match      text  contains match
 local function IsWhitelisted(msg)
     if type(msg) ~= "string" then return false end
     if not db.whitelist then return false end
     local msgLower = string.lower(msg)
     for _, entry in ipairs(db.whitelist) do
-        if string.find(msgLower, string.lower(entry), 1, true) then
-            return true
+        local text, mode = entry, "contains"
+        local prefix = string.sub(entry, 1, 1)
+        if prefix == "^" then
+            text, mode = string.sub(entry, 2), "starts"
+        elseif prefix == "=" then
+            text, mode = string.sub(entry, 2), "exact"
+        end
+        local needle = string.lower(text)
+        if mode == "exact" then
+            if msgLower == needle then return true end
+        elseif mode == "starts" then
+            if string.sub(msgLower, 1, #needle) == needle then return true end
+        else
+            if string.find(msgLower, needle, 1, true) then return true end
         end
     end
     return false
@@ -84,6 +100,29 @@ local function IsMessageIdBlocked(msgId)
     for _, blockedId in ipairs(db.blockedMessageIds) do
         if blockedId == msgId then
             return true
+        end
+    end
+    return false
+end
+
+-- Last-chance reprieve before a message is blocked: if any whitelisted addon's
+-- folder is on the current call stack, the message came from an addon the user
+-- trusts, so let it through. Only called when something is about to be filtered
+-- AND db.addonWhitelist is non-empty, so debugstack() costs nothing otherwise.
+-- Catches direct AddMessage, AceConsole :Print, and print() wrappers alike -
+-- the calling addon's file is on the stack in every one of those. It won't
+-- catch a message printed from a bare library callback with no addon frame in
+-- the stack; use a text whitelist entry for those.
+local function IsFromWhitelistedAddon()
+    if not db.addonWhitelist or #db.addonWhitelist == 0 then return false end
+    local stack = debugstack(2, 40, 0)
+    if not stack or stack == "" then return false end
+    stack = string.lower(stack)
+    for _, name in ipairs(db.addonWhitelist) do
+        local n = string.lower(name)
+        if string.find(stack, "addons\\" .. n .. "\\", 1, true)
+            or string.find(stack, "addons/" .. n .. "/", 1, true) then
+            return true, name
         end
     end
     return false
@@ -170,30 +209,41 @@ local function ShouldFilter(msg, msgId)
         end
         return false
     end
-    
+
+    -- Decide whether this message would be blocked, why, and whether that block
+    -- is an explicit user filter or just the default "addon spam on login" rule.
+    local block, reason, explicit = false, nil, false
+
     if IsMessageIdBlocked(msgId) then
-        if db and db.debug then
-            originalPrint("|cFFFF6600CleanStart:|r Blocked by ID: " .. tostring(msgId))
+        block, reason, explicit = true, "ID " .. tostring(msgId), true
+    elseif MatchesCustomFilter(msg) then
+        block, reason, explicit = true, "custom filter", true
+    else
+        local hasMessageId = msgId and type(msgId) == "number"
+        -- Only reached during the capture window (hooks are removed once it closes).
+        if captureActive and not hasMessageId then
+            block, reason = true, "addon message on login"
         end
-        return true
     end
-    
-    local matched, word = MatchesCustomFilter(msg)
-    if matched then
-        if db and db.debug then
-            originalPrint("|cFFFF6600CleanStart:|r Custom filter blocked: \"" .. msg .. "\"")
+
+    if not block then return false end
+
+    -- Reprieve: a message from a whitelisted addon is let through - but only past
+    -- the default login block, not past a filter the user set on purpose.
+    if not explicit then
+        local fromAddon, addonName = IsFromWhitelistedAddon()
+        if fromAddon then
+            if db and db.debug then
+                originalPrint("|cFF00AAFFCleanStart:|r Allowed (whitelisted addon " .. addonName .. "): \"" .. msg .. "\"")
+            end
+            return false
         end
-        return true
     end
 
-    local hasMessageId = msgId and type(msgId) == "number"
-
-    -- Only reached during the capture window (hooks are removed once it closes).
-    if captureActive then
-        return not hasMessageId
+    if db and db.debug then
+        originalPrint("|cFFFF6600CleanStart:|r Blocked (" .. reason .. "): \"" .. msg .. "\"")
     end
-
-    return false
+    return true
 end
 
 -- ─── Chat Frame Hooks ──────────────────────────────────────────────────────────
@@ -216,42 +266,33 @@ local function ShouldBlockMessage(msg, msgId, r, g, b)
     return blockOrErr
 end
 
-local function HookChatFrame(frame)
-    if frame and frame.AddMessage and not hookedFrames[frame] then
-        local orig = frame.AddMessage
-        hookedFrames[frame] = orig
-        frame.AddMessage = function(self, msg, r, g, b, id, ...)
-            if ShouldBlockMessage(msg, id, r, g, b) then return end
-            orig(self, msg, r, g, b, id, ...)
-        end
-    end
-end
-
-local function UnhookAllFrames()
-    -- Unhooking while in combat can taint the chat frames, so defer until combat ends.
+local function RemoveHooks()
+    -- Touching the chat frame's AddMessage in combat can taint it, so defer.
     if InCombatLockdown() then
         if db and db.debug then
-            originalPrint("|cFFFF6600CleanStart:|r Cannot unhook frames while in combat, will retry later.")
+            originalPrint("|cFFFF6600CleanStart:|r Cannot unhook while in combat, will retry later.")
         end
         C_Timer.After(1, function()
             if InCombatLockdown() then
-                C_Timer.After(1, UnhookAllFrames)
+                C_Timer.After(1, RemoveHooks)
             else
-                UnhookAllFrames()
+                RemoveHooks()
             end
         end)
         return
     end
 
-    for frame, orig in pairs(hookedFrames) do
-        if frame then
-            frame.AddMessage = orig
-        end
+    -- Only pull our hook if it's still the installed one. If a chat addon
+    -- (EllesmereUI, ElvUI, ...) replaced DEFAULT_CHAT_FRAME.AddMessage after us,
+    -- our closure is now inside *its* chain, where it forwards harmlessly once
+    -- captureActive is false. Blindly restoring the Blizzard original here would
+    -- detach that addon's handler and silently break its chat.
+    if DEFAULT_CHAT_FRAME.AddMessage == hookedAddMessage then
+        DEFAULT_CHAT_FRAME.AddMessage = originalAddMessage
     end
-    hookedFrames = {}
-
-    DEFAULT_CHAT_FRAME.AddMessage = originalAddMessage
-    print = originalPrint
+    if print == hookedPrint then
+        print = originalPrint
+    end
 
     if db and db.debug then
         originalPrint("|cFF00FF00CleanStart:|r Hooks removed, addon inactive.")
@@ -259,12 +300,16 @@ local function UnhookAllFrames()
 end
 
 -- Hooked immediately at file load, before PLAYER_LOGIN, so nothing during the
--- capture window is missed.
-DEFAULT_CHAT_FRAME.AddMessage = function(self, msg, r, g, b, id, ...)
-    if ShouldBlockMessage(msg, id, r, g, b) then return end
+-- capture window is missed. We field-replace AddMessage on DEFAULT_CHAT_FRAME
+-- only: login spam lands there, and every frame we replace carries a
+-- session-long taint flag on its AddMessage even after we restore the original.
+-- captureActive short-circuit: if a chat addon chained this closure, it may
+-- outlive the capture window inside that addon's call chain - stay cheap then.
+hookedAddMessage = function(self, msg, r, g, b, id, ...)
+    if captureActive and ShouldBlockMessage(msg, id, r, g, b) then return end
     originalAddMessage(self, msg, r, g, b, id, ...)
 end
-hookedFrames[DEFAULT_CHAT_FRAME] = originalAddMessage
+DEFAULT_CHAT_FRAME.AddMessage = hookedAddMessage
 
 -- Same fail-open contract as ShouldBlockMessage.
 local function ShouldBlockPrint(...)
@@ -276,7 +321,7 @@ local function ShouldBlockPrint(...)
     return ShouldFilter(msg, nil)
 end
 
-print = function(...)
+hookedPrint = function(...)
     local ok, block = pcall(ShouldBlockPrint, ...)
     if not ok then
         geterrorhandler()(block)
@@ -285,6 +330,7 @@ print = function(...)
     end
     originalPrint(...)
 end
+print = hookedPrint
 
 -- ─── GUI System ────────────────────────────────────────────────────────────────
 
@@ -340,6 +386,14 @@ local function CreateGUI()
     guiFrame = CreateFrame("Frame", "CleanStartGUI", UIParent, "BasicFrameTemplateWithInset")
     guiFrame:SetSize(600, 500)
     guiFrame:SetPoint("CENTER")
+    -- Strata ladder, each a full level apart so nothing has to fight over frame
+    -- levels: HIGH (this window) < DIALOG (Filters List) < FULLSCREEN_DIALOG
+    -- (edit dialog). HIGH already clears unit frames and action bars.
+    guiFrame:SetFrameStrata("HIGH")
+    -- Raise the whole window (body + children together) to the front of its
+    -- strata on click, so a stray child button can't poke over another addon's
+    -- frame that happens to share the strata.
+    guiFrame:SetToplevel(true)
     guiFrame:SetMovable(true)
     guiFrame:EnableMouse(true)
     guiFrame:SetResizable(true)
@@ -414,6 +468,9 @@ local function CreateGUI()
     scrollFrame = CreateFrame("ScrollFrame", "CleanStartScrollFrame", guiFrame, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", guiFrame, "TOPLEFT", 10, -30)
     scrollFrame:SetPoint("BOTTOMRIGHT", guiFrame, "BOTTOMRIGHT", -30, 60)
+    -- Keep rows (and their buttons) that scroll past the edges from drawing over
+    -- the rest of the UI instead of being cropped to the list area.
+    if scrollFrame.SetClipsChildren then scrollFrame:SetClipsChildren(true) end
 
     scrollChild = CreateFrame("Frame", "CleanStartScrollChild", scrollFrame)
     scrollChild:SetSize(560, 1)
@@ -438,7 +495,8 @@ local function CreateEditDialog()
     editDialog:SetClampedToScreen(true)
     editDialog:Hide()
     editDialog:HookScript("OnHide", SyncEscProxy)
-    editDialog:SetFrameStrata("DIALOG")
+    editDialog:SetFrameStrata("FULLSCREEN_DIALOG")
+    editDialog:SetToplevel(true)
 
     editDialog.title = editDialog:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     editDialog.title:SetPoint("TOP", editDialog, "TOP", 0, -5)
@@ -454,6 +512,15 @@ local function CreateEditDialog()
     editDialog.blockByIdCheckbox.Text:SetPoint("LEFT", editDialog.blockByIdCheckbox, "RIGHT", 5, 0)
     editDialog.blockByIdCheckbox.Text:SetText("Block by Message ID (blocks all messages with this system ID)")
     editDialog.blockByIdCheckbox:SetHitRectInsets(0, -editDialog.blockByIdCheckbox.Text:GetStringWidth(), 0, 0)
+
+    -- Shown for addon rows instead of the ID checkbox: pick allow (default) or block.
+    editDialog.blockModeCheckbox = CreateFrame("CheckButton", "CleanStartBlockModeCheck", editDialog, "ChatConfigCheckButtonTemplate")
+    editDialog.blockModeCheckbox:SetPoint("BOTTOMLEFT", editDialog, "BOTTOMLEFT", 15, 60)
+    editDialog.blockModeCheckbox.Text = editDialog.blockModeCheckbox:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    editDialog.blockModeCheckbox.Text:SetPoint("LEFT", editDialog.blockModeCheckbox, "RIGHT", 5, 0)
+    editDialog.blockModeCheckbox.Text:SetText("Block instead of allow (matching messages are hidden)")
+    editDialog.blockModeCheckbox:SetHitRectInsets(0, -editDialog.blockModeCheckbox.Text:GetStringWidth(), 0, 0)
+    editDialog.blockModeCheckbox:Hide()
 
     local scrollFrameEdit = CreateFrame("ScrollFrame", "CleanStartEditScrollFrame", editDialog, "UIPanelScrollFrameTemplate")
     scrollFrameEdit:SetPoint("TOPLEFT", editDialog, "TOPLEFT", 15, -90)
@@ -480,17 +547,19 @@ local function CreateEditDialog()
     okBtn:SetText("OK")
     okBtn:SetScript("OnClick", function()
         if editDialog.onConfirm then
-            editDialog.onConfirm(editDialog.editBox:GetText(), editDialog.blockByIdCheckbox:GetChecked())
+            editDialog.onConfirm(editDialog.editBox:GetText(),
+                editDialog.blockByIdCheckbox:GetChecked(),
+                editDialog.blockModeCheckbox:GetChecked())
         end
         editDialog:Hide()
     end)
 end
 
-local function ShowEditDialog(msgText, msgId, onConfirm)
+local function ShowEditDialog(msgText, msgId, onConfirm, isAddonRow)
     if not editDialog then
         CreateEditDialog()
     end
-    
+
     editDialog.editBox:SetText(msgText)
     editDialog.editBox:HighlightText()
     editDialog.editBox:SetFocus()
@@ -502,9 +571,17 @@ local function ShowEditDialog(msgText, msgId, onConfirm)
         editDialog.blockByIdCheckbox.msgId = msgId
     else
         editDialog.blockByIdCheckbox:Hide()
+        editDialog.blockByIdCheckbox:SetChecked(false)
         editDialog.blockByIdCheckbox.msgId = nil
     end
-    
+
+    editDialog.blockModeCheckbox:SetChecked(false)
+    if isAddonRow then
+        editDialog.blockModeCheckbox:Show()
+    else
+        editDialog.blockModeCheckbox:Hide()
+    end
+
     editDialog:Show()
     escProxyFrame:Show()
 end
@@ -745,9 +822,117 @@ function CleanStart_RefreshMessageList()
                 end
             end)
         else
+            -- Addon message: blocked by default during the login window. Same
+            -- Allow / Block / Custom actions as system rows, except Allow has to
+            -- add a positive whitelist entry (there's no "allowed by default").
             local statusText = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
             statusText:SetPoint("TOPRIGHT", rowFrame, "TOPRIGHT", -5, -3)
-            statusText:SetText("|cFFFF6666Blocked by default|r")
+            if IsWhitelisted(msg.text) then
+                statusText:SetText("|cFF00FF00ALLOWED (whitelist)|r")
+                msg.userAction = "allowed"
+            elseif MatchesCustomFilter(msg.text) then
+                statusText:SetText("|cFFFF0000BLOCKED (filter)|r")
+                msg.userAction = "blocked"
+            else
+                statusText:SetText("|cFFFF6666Blocked by default|r")
+                msg.userAction = nil
+            end
+
+            -- Rightmost: Custom, then Block, then Allow.
+            local customBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
+            customBtn:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -5, 5)
+            customBtn:SetSize(70, 22)
+            customBtn:SetText("Custom")
+            customBtn:SetScript("OnClick", function()
+                ShowEditDialog(msg.text, nil, function(filterText, _, blockMode)
+                    if not filterText or filterText == "" then return end
+                    local dest = blockMode and db.customFilters or db.whitelist
+                    local exists = false
+                    for _, v in ipairs(dest) do
+                        if v == filterText then
+                            exists = true
+                            break
+                        end
+                    end
+                    if not exists then
+                        table.insert(dest, filterText)
+                    end
+                    CleanStart_RefreshMessageList()
+                    if db.debug then
+                        originalPrint("|cFF00AAFFCleanStart:|r " ..
+                            (blockMode and "Blocked" or "Allowed") ..
+                            " (custom): \"" .. filterText .. "\"")
+                    end
+                end, true)
+            end)
+
+            local blockBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
+            blockBtn:SetPoint("RIGHT", customBtn, "LEFT", -5, 0)
+            blockBtn:SetSize(70, 22)
+            blockBtn:SetText("Block")
+            blockBtn:SetScript("OnClick", function()
+                local entry = "=" .. msg.text
+                local exists = false
+                for _, filter in ipairs(db.customFilters) do
+                    if filter == entry then
+                        exists = true
+                        break
+                    end
+                end
+                if not exists then
+                    table.insert(db.customFilters, entry)
+                end
+                for j = #db.whitelist, 1, -1 do
+                    if db.whitelist[j] == entry then
+                        table.remove(db.whitelist, j)
+                    end
+                end
+                CleanStart_RefreshMessageList()
+                if db.debug then
+                    originalPrint("|cFFFF6600CleanStart:|r Blocked (exact): \"" .. msg.text .. "\"")
+                end
+            end)
+
+            local allowBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
+            allowBtn:SetPoint("RIGHT", blockBtn, "LEFT", -5, 0)
+            allowBtn:SetSize(70, 22)
+            allowBtn:SetText("Allow")
+            allowBtn:SetScript("OnClick", function()
+                local entry = "=" .. msg.text
+                local exists = false
+                for _, w in ipairs(db.whitelist) do
+                    if w == entry then
+                        exists = true
+                        break
+                    end
+                end
+                if not exists then
+                    table.insert(db.whitelist, entry)
+                end
+                local msgTextLower = string.lower(msg.text)
+                for j = #db.customFilters, 1, -1 do
+                    local filter = db.customFilters[j]
+                    if string.sub(filter, 1, 1) == "=" then
+                        if string.lower(string.sub(filter, 2)) == msgTextLower then
+                            table.remove(db.customFilters, j)
+                        end
+                    elseif string.sub(filter, 1, 1) == "^" then
+                        local pattern = string.lower(string.sub(filter, 2))
+                        if string.sub(msgTextLower, 1, #pattern) == pattern then
+                            table.remove(db.customFilters, j)
+                        end
+                    else
+                        local pattern = string.lower(filter)
+                        if string.find(msgTextLower, pattern, 1, true) then
+                            table.remove(db.customFilters, j)
+                        end
+                    end
+                end
+                CleanStart_RefreshMessageList()
+                if db.debug then
+                    originalPrint("|cFF00FF00CleanStart:|r Allowed (whitelist): \"" .. msg.text .. "\"")
+                end
+            end)
         end
 
         table.insert(messageRows, {frame = rowFrame, msg = msg})
@@ -762,7 +947,7 @@ function CleanStart_ToggleGUI()
     if not guiFrame then
         CreateGUI()
     end
-    
+
     if guiFrame:IsShown() then
         guiFrame:Hide()
     else
@@ -902,10 +1087,120 @@ local function RefreshFiltersList()
         yOffset = yOffset - rowHeight - 2
     end
 
-    if #db.customFilters == 0 and #db.blockedMessageIds == 0 then
+    for i, entry in ipairs(db.whitelist) do
+        local wlType = "contains"
+        local displayText = entry
+        if string.sub(entry, 1, 1) == "=" then
+            wlType = "exact"
+            displayText = string.sub(entry, 2)
+        elseif string.sub(entry, 1, 1) == "^" then
+            wlType = "starts"
+            displayText = string.sub(entry, 2)
+        end
+
+        local rowFrame = CreateFrame("Frame", "CleanStartWhitelistRow" .. i, filtersListScrollChild)
+        rowFrame:SetHeight(rowHeight)
+        rowFrame:SetPoint("TOPLEFT", filtersListScrollChild, "TOPLEFT", 0, yOffset)
+        rowFrame:SetPoint("TOPRIGHT", filtersListScrollChild, "TOPRIGHT", 10, yOffset)
+
+        rowFrame.bg = rowFrame:CreateTexture(nil, "BACKGROUND")
+        rowFrame.bg:SetAllPoints()
+        rowFrame.bg:SetColorTexture(0.2, 0.45, 0.25, 0.3)
+
+        local typeText = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        typeText:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -3)
+        typeText:SetText("|cFF44FF44[" .. string.upper(wlType) .. " ALLOW]|r")
+
+        local filterTextWidget = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        filterTextWidget:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -20)
+        filterTextWidget:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -25, 30)
+        filterTextWidget:SetJustifyH("LEFT")
+        filterTextWidget:SetJustifyV("TOP")
+        filterTextWidget:SetWordWrap(true)
+        local trunc = displayText
+        if #trunc > 500 then trunc = string.sub(trunc, 1, 497) .. "..." end
+        filterTextWidget:SetText(trunc)
+
+        local editBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
+        editBtn:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -5, 5)
+        editBtn:SetSize(70, 22)
+        editBtn:SetText("Edit")
+        editBtn:SetScript("OnClick", function()
+            ShowEditDialog(displayText, nil, function(newText)
+                if newText and newText ~= "" then
+                    db.whitelist[i] = newText
+                    RefreshFiltersList()
+                    CleanStart_RefreshMessageList()
+                    originalPrint("|cFF00FF00CleanStart:|r Whitelist entry updated.")
+                end
+            end)
+        end)
+
+        local removeBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
+        removeBtn:SetPoint("RIGHT", editBtn, "LEFT", -5, 0)
+        removeBtn:SetSize(70, 22)
+        removeBtn:SetText("Remove")
+        removeBtn:SetScript("OnClick", function()
+            table.remove(db.whitelist, i)
+            RefreshFiltersList()
+            CleanStart_RefreshMessageList()
+            originalPrint("|cFF00FF00CleanStart:|r Whitelist entry removed.")
+        end)
+
+        table.insert(filterRows, {frame = rowFrame, filter = entry, filterType = "whitelist", index = i})
+        yOffset = yOffset - rowHeight - 2
+    end
+
+    for i, name in ipairs(db.addonWhitelist) do
+        local rowFrame = CreateFrame("Frame", "CleanStartAddonWhitelistRow" .. i, filtersListScrollChild)
+        rowFrame:SetHeight(rowHeight)
+        rowFrame:SetPoint("TOPLEFT", filtersListScrollChild, "TOPLEFT", 0, yOffset)
+        rowFrame:SetPoint("TOPRIGHT", filtersListScrollChild, "TOPRIGHT", 10, yOffset)
+
+        rowFrame.bg = rowFrame:CreateTexture(nil, "BACKGROUND")
+        rowFrame.bg:SetAllPoints()
+        rowFrame.bg:SetColorTexture(0.2, 0.4, 0.4, 0.3)
+
+        local typeText = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        typeText:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -3)
+        typeText:SetText("|cFF44FFFF[WHITELISTED ADDON]|r")
+
+        local filterTextWidget = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        filterTextWidget:SetPoint("TOPLEFT", rowFrame, "TOPLEFT", 5, -20)
+        filterTextWidget:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -25, 30)
+        filterTextWidget:SetJustifyH("LEFT")
+        filterTextWidget:SetJustifyV("TOP")
+        filterTextWidget:SetWordWrap(true)
+        filterTextWidget:SetText(name .. "\n\nNothing this addon prints during login is blocked.")
+
+        -- Same right-aligned layout as the other rows: Remove, then a disabled
+        -- Edit (an addon folder name has no pattern to edit).
+        local editBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
+        editBtn:SetPoint("BOTTOMRIGHT", rowFrame, "BOTTOMRIGHT", -5, 5)
+        editBtn:SetSize(70, 22)
+        editBtn:SetText("Edit")
+        editBtn:Disable()
+
+        local removeBtn = CreateFrame("Button", nil, rowFrame, "UIPanelButtonTemplate")
+        removeBtn:SetPoint("RIGHT", editBtn, "LEFT", -5, 0)
+        removeBtn:SetSize(70, 22)
+        removeBtn:SetText("Remove")
+        removeBtn:SetScript("OnClick", function()
+            table.remove(db.addonWhitelist, i)
+            RefreshFiltersList()
+            CleanStart_RefreshMessageList()
+            originalPrint("|cFF00FF00CleanStart:|r Whitelisted addon removed.")
+        end)
+
+        table.insert(filterRows, {frame = rowFrame, filter = name, filterType = "addon", index = i})
+        yOffset = yOffset - rowHeight - 2
+    end
+
+    if #db.customFilters == 0 and #db.blockedMessageIds == 0
+        and #db.whitelist == 0 and #db.addonWhitelist == 0 then
         local noFiltersText = filtersListScrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         noFiltersText:SetPoint("TOP", filtersListScrollChild, "TOP", 0, -20)
-        noFiltersText:SetText("|cFFAAAAAANo filters configured.|r\n\nUse the Block/Custom buttons on messages to create filters.")
+        noFiltersText:SetText("|cFFAAAAAANo filters configured.|r\n\nUse the Allow / Block / Custom buttons on messages to create filters.")
     end
 
     local totalHeight = math.abs(yOffset) + 5
@@ -930,7 +1225,8 @@ local function CreateFiltersListWindow()
     filtersListFrame:SetScript("OnDragStart", filtersListFrame.StartMoving)
     filtersListFrame:SetScript("OnDragStop", filtersListFrame.StopMovingOrSizing)
     filtersListFrame:SetClampedToScreen(true)
-    filtersListFrame:SetFrameStrata("HIGH")
+    filtersListFrame:SetFrameStrata("DIALOG")  -- one strata above the Captured Messages window
+    filtersListFrame:SetToplevel(true)
     filtersListFrame:Hide()
     filtersListFrame:HookScript("OnHide", SyncEscProxy)
 
@@ -978,6 +1274,7 @@ local function CreateFiltersListWindow()
     filtersListScrollFrame = CreateFrame("ScrollFrame", "CleanStartFiltersListScrollFrame", filtersListFrame, "UIPanelScrollFrameTemplate")
     filtersListScrollFrame:SetPoint("TOPLEFT", filtersListFrame, "TOPLEFT", 10, -30)
     filtersListScrollFrame:SetPoint("BOTTOMRIGHT", filtersListFrame, "BOTTOMRIGHT", -30, 60)
+    if filtersListScrollFrame.SetClipsChildren then filtersListScrollFrame:SetClipsChildren(true) end
 
     filtersListScrollChild = CreateFrame("Frame", "CleanStartFiltersListScrollChild", filtersListScrollFrame)
     filtersListScrollChild:SetSize(560, 1)
@@ -993,8 +1290,8 @@ function CleanStart_ToggleFiltersList()
         filtersListFrame:Hide()
     else
         filtersListFrame.statusText:SetText(string.format(
-            "Text Filters: %d | Blocked IDs: %d",
-            #db.customFilters, #db.blockedMessageIds))
+            "Filters: %d | Blocked IDs: %d | Allow: %d | Addons: %d",
+            #db.customFilters, #db.blockedMessageIds, #db.whitelist, #db.addonWhitelist))
         RefreshFiltersList()
         filtersListFrame:Show()
         escProxyFrame:Show()
@@ -1005,7 +1302,7 @@ end
 
 local function CloseCaptureWindow()
     captureActive = false
-    UnhookAllFrames()
+    RemoveHooks()
     if db.debug then
         originalPrint("|cFF00FF00CleanStart:|r Capture window closed.")
         originalPrint("|cFF00FF00CleanStart:|r Captured " .. #capturedMessages .. " messages. Use /cs to review.")
@@ -1013,7 +1310,7 @@ local function CloseCaptureWindow()
 end
 
 -- Starts the login capture window, deferring the close by 1s at a time while
--- the player is in combat so UnhookAllFrames doesn't have to fight taint.
+-- the player is in combat so RemoveHooks doesn't have to fight taint.
 local function StartCaptureWindowTimer()
     if InCombatLockdown() then
         if db.debug then
@@ -1046,17 +1343,16 @@ frame:SetScript("OnEvent", function(self, event, ...)
         -- the capture window instead of briefly filtering live chat.
         if IsInInstance() then
             captureActive = false
-            UnhookAllFrames()
+            RemoveHooks()
             if db.debug then
                 originalPrint("|cFF00FF00CleanStart:|r Reload detected inside an instance, capture skipped.")
             end
             return
         end
 
-        -- DEFAULT_CHAT_FRAME and print were already hooked at file load.
-        for i = 1, NUM_CHAT_WINDOWS or 10 do
-            HookChatFrame(_G["ChatFrame" .. i])
-        end
+        -- DEFAULT_CHAT_FRAME and print were hooked at file load. ChatFrame2..10
+        -- are deliberately left alone (see the file-load hook above); output
+        -- routed to a non-default tab during the ~3s window isn't intercepted.
 
         StartCaptureWindowTimer()
 
@@ -1100,6 +1396,7 @@ function SlashCommandHandler(input)
         originalPrint("  Capture window : " .. db.blockWindow .. "s")
         originalPrint("  Custom filters : " .. #db.customFilters)
         originalPrint("  Whitelist entries : " .. #db.whitelist)
+        originalPrint("  Addon whitelist : " .. #db.addonWhitelist)
         originalPrint("  Captured messages : " .. #capturedMessages)
 
     elseif cmd == "debug" then
@@ -1168,7 +1465,39 @@ function SlashCommandHandler(input)
     elseif cmd == "whitelist" then
         local sub, warg = arg:match("^(%S+)%s*(.*)$")
         sub = sub and sub:lower() or ""
-        if sub == "add" and warg ~= "" then
+        if sub == "addon" then
+            local asub, aarg = warg:match("^(%S+)%s*(.*)$")
+            asub = asub and asub:lower() or ""
+            if asub == "add" and aarg ~= "" then
+                table.insert(db.addonWhitelist, aarg)
+                originalPrint("|cFF00FF00CleanStart:|r Addon whitelisted: \"" .. aarg .. "\"")
+            elseif (asub == "remove" or asub == "rm") and aarg ~= "" then
+                local idx = tonumber(aarg)
+                if idx and db.addonWhitelist[idx] then
+                    originalPrint("|cFF00FF00CleanStart:|r Removed addon: \"" .. table.remove(db.addonWhitelist, idx) .. "\"")
+                else
+                    for i, v in ipairs(db.addonWhitelist) do
+                        if v:lower() == aarg:lower() then
+                            table.remove(db.addonWhitelist, i)
+                            originalPrint("|cFF00FF00CleanStart:|r Removed addon: \"" .. aarg .. "\"")
+                            return
+                        end
+                    end
+                    originalPrint("|cFF00FF00CleanStart:|r Not found: \"" .. aarg .. "\"")
+                end
+            elseif asub == "list" then
+                if #db.addonWhitelist == 0 then
+                    originalPrint("|cFF00FF00CleanStart:|r Addon whitelist is empty.")
+                else
+                    originalPrint("|cFF00FF00CleanStart:|r Addon whitelist:")
+                    for i, v in ipairs(db.addonWhitelist) do
+                        originalPrint("  " .. i .. ". \"" .. v .. "\"")
+                    end
+                end
+            else
+                originalPrint("|cFF00FF00CleanStart:|r Usage: /cs whitelist addon add | remove | list <name>")
+            end
+        elseif sub == "add" and warg ~= "" then
             table.insert(db.whitelist, warg)
             originalPrint("|cFF00FF00CleanStart:|r Whitelisted: \"" .. warg .. "\"")
         elseif (sub == "remove" or sub == "rm") and warg ~= "" then
@@ -1196,6 +1525,7 @@ function SlashCommandHandler(input)
             end
         else
             originalPrint("|cFF00FF00CleanStart:|r Usage: /cs whitelist add | remove | list <text>")
+            originalPrint("|cFF00FF00CleanStart:|r        /cs whitelist addon add | remove | list <name>")
         end
 
     elseif cmd == "help" then
@@ -1209,6 +1539,7 @@ function SlashCommandHandler(input)
         originalPrint("  /cs remove <#>   - Remove a filter by number")
         originalPrint("  /cs clearfilters - Clear all filters")
         originalPrint("  /cs whitelist add | remove | list <text> - Manage whitelist")
+        originalPrint("  /cs whitelist addon add | remove | list <name> - Whitelist a whole addon")
         originalPrint("  /cs debug        - Toggle debug output")
 
     else
