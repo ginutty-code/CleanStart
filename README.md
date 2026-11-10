@@ -14,7 +14,7 @@ A World of Warcraft addon that captures all messages during login and provides a
 - **Whitelist System**: Protect important messages from being filtered - by text pattern, or by addon (nothing a whitelisted addon prints is blocked)
 - **Debug Mode**: See detailed information about message processing
 - **Combat-Safe Reload**: Safely handles `/reload` during combat - delays cleanup until combat ends
-- **Instance-Safe Reload**: If you `/reload` while already inside a dungeon or raid, the capture window is skipped entirely instead of briefly running against live chat
+- **Instance-Safe**: Works the same inside dungeons, raids and player housing. Restricted ("secret") chat values are never inspected and always pass through, and any filtering error fails open so no message is lost
 - **Lightweight**: Minimal impact on game performance
 
 ## Installation
@@ -30,7 +30,7 @@ A World of Warcraft addon that captures all messages during login and provides a
 
 When you log in, the addon captures ALL chat messages during a short window (default 3 seconds). Addon messages are blocked during this window, while system messages are allowed through.
 
-If `/reload` is used while you're already inside a dungeon or raid, there's no login spam to catch, so CleanStart detects this and skips the capture window entirely rather than running it against live instance chat.
+The capture window runs the same way after a `/reload` inside an instance. Messages Blizzard marks as restricted ("secret" values) are never inspected and always pass through untouched.
 
 ### Message Types
 

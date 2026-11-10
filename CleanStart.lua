@@ -248,8 +248,20 @@ end
 
 -- ─── Chat Frame Hooks ──────────────────────────────────────────────────────────
 
+-- In restricted contexts (M+, raids, ...) Blizzard can hand addons "secret"
+-- values; string ops on them throw. Never inspect those - let them through.
+local function IsSecret(v)
+    return issecretvalue and issecretvalue(v) or false
+end
+
 local function ProcessCapturedMessage(msg, msgId, r, g, b)
     if not captureActive then return false end
+    if IsSecret(msg) or IsSecret(msgId) then
+        if db and db.debug then
+            originalPrint("|cFFFF6600CleanStart:|r Skipped a secret message (hook)")
+        end
+        return false
+    end
     CaptureMessage(msg, msgId, r, g, b)
     return ShouldFilter(msg, msgId)
 end
@@ -315,7 +327,16 @@ DEFAULT_CHAT_FRAME.AddMessage = hookedAddMessage
 local function ShouldBlockPrint(...)
     if not captureActive then return false end
     local parts = {}
-    for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
+    for i = 1, select("#", ...) do
+        local v = select(i, ...)
+        if IsSecret(v) then
+            if db and db.debug then
+                originalPrint("|cFFFF6600CleanStart:|r Skipped a secret message (print)")
+            end
+            return false
+        end
+        parts[i] = tostring(v)
+    end
     local msg = table.concat(parts, " ")
     CaptureMessage(msg, nil, 1, 1, 1)
     return ShouldFilter(msg, nil)
@@ -1336,23 +1357,22 @@ frame:SetScript("OnEvent", function(self, event, ...)
         if playerLoginFired then return end
         playerLoginFired = true
 
-        capturedMessages = {}
+        -- capturedMessages is deliberately NOT reset here: the hooks are live from
+        -- file load, so messages from addons that loaded before PLAYER_LOGIN are
+        -- already in it and must stay reviewable in /cs.
 
-        -- A /reload mid-instance isn't a real login - no login spam to catch,
-        -- and Blizzard restricts chat history access while instanced. Skip
-        -- the capture window instead of briefly filtering live chat.
-        if IsInInstance() then
-            captureActive = false
-            RemoveHooks()
-            if db.debug then
-                originalPrint("|cFF00FF00CleanStart:|r Reload detected inside an instance, capture skipped.")
-            end
-            return
-        end
+        -- Filtering runs in every instance type. Restricted ("secret") values
+        -- are skipped per-message in ProcessCapturedMessage / ShouldBlockPrint,
+        -- and all filtering is pcall'd fail-open, so combat instances are safe.
 
         -- DEFAULT_CHAT_FRAME and print were hooked at file load. ChatFrame2..10
         -- are deliberately left alone (see the file-load hook above); output
         -- routed to a non-default tab during the ~3s window isn't intercepted.
+
+        if db.debug then
+            originalPrint("|cFF00FF00CleanStart:|r PLAYER_LOGIN, instance type: " .. tostring(select(2, IsInInstance())) ..
+                ", captureActive: " .. tostring(captureActive))
+        end
 
         StartCaptureWindowTimer()
 
