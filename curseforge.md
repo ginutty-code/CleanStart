@@ -97,6 +97,7 @@ The same applies if you /reload inside a dungeon, raid or player housing. Messag
 - Restricted ("secret") chat values are never inspected and always pass through, so combat instances cannot cause errors
 - Messages from addons that load before !CleanStart's login handler now stay in the /cs review window instead of being dropped from the list
 - Debug output now reports the instance type at login and any skipped restricted messages
+- Interface version updated to 120105 / 120107
 
 ### 1.3.0
 
